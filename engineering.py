@@ -1,8 +1,7 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 
-from garmin_preprocessing import build_daily_master
+from garmin_daily_preprocessing import build_daily_master
 from garmin_running_preprocessing import build_running_master
 
 print("Starting full pipeline...")
@@ -85,9 +84,5 @@ df_run_daily["session_flag"] = np.select(
 df_daily_master.to_excel("daily_engine_output.xlsx", index=False)
 
 df_run_daily.to_excel("running_engine_output.xlsx", index=False)
-
-plt.plot(df_daily_master["Date"], df_daily_master["readiness_score"])
-plt.title("Readiness Over Time")
-plt.savefig("readiness_plot.png")
 
 print("Pipeline completed successfully.")
