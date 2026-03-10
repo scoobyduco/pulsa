@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
 from datetime import timedelta
 
 # ---------------------------------------------------
@@ -111,23 +111,15 @@ col1, col2 = st.columns(2)
 
 with col1:
     fig, ax = plt.subplots()
-    sns.boxplot(
-        data=df,
-        x="cyclePhase",
-        y="restingHeartRate",
-        ax=ax
-    )
+    df.boxplot(column="restingHeartRate", by="cyclePhase", ax=ax)
+    plt.suptitle("")
     ax.set_title("Resting HR by Cycle Phase")
     st.pyplot(fig)
 
 with col2:
     fig, ax = plt.subplots()
-    sns.boxplot(
-        data=df,
-        x="cyclePhase",
-        y="total_sleep_hours",
-        ax=ax
-    )
+    df.boxplot(column="total_sleep_hours", by="cyclePhase", ax=ax)
+    plt.suptitle("")
     ax.set_title("Sleep Duration by Cycle Phase")
     st.pyplot(fig)
 
@@ -163,24 +155,20 @@ col1, col2 = st.columns(2)
 
 with col1:
     fig, ax = plt.subplots()
-    sns.boxplot(
-        data=df,
-        x="cyclePhase",
-        y="efficiency_index",
-        ax=ax
-    )
+    df.boxplot(column="efficiency_index", by="cyclePhase", ax=ax)
+    plt.suptitle("")
     ax.set_title("Efficiency by Cycle Phase")
     st.pyplot(fig)
 
 with col2:
     fig, ax = plt.subplots()
-    sns.regplot(
-        data=df,
-        x="cycleProgress",
-        y="efficiency_index",
-        scatter_kws={"alpha": 0.3},
-        ax=ax
-    )
+    d = df.dropna(subset=["cycleProgress", "efficiency_index"])
+    ax.scatter(d["cycleProgress"], d["efficiency_index"], alpha=0.3)
+    if len(d) > 1:
+        z = np.polyfit(d["cycleProgress"], d["efficiency_index"], 1)
+        p = np.poly1d(z)
+        x_line = np.linspace(d["cycleProgress"].min(), d["cycleProgress"].max(), 100)
+        ax.plot(x_line, p(x_line), "r-", linewidth=2)
     ax.set_title("Efficiency vs Cycle Progress")
     st.pyplot(fig)
 
