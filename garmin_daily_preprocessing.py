@@ -2,6 +2,10 @@
 Garmin daily wellness, sleep, and cycle preprocessing.
 Builds df_daily_master from raw Garmin JSON exports.
 
+Supports both:
+- Flat layout: garmin_data/UDSFile_*.json, *_sleepData.json, *MenstrualCycles*.json
+- Garmin export layout: garmin_data/DI_CONNECT/DI-Connect-Aggregator/UDSFile_*.json, etc.
+
 Outputs
 -------
 df_daily_master: daily physiology + sleep + cycle, merged on Date
@@ -21,13 +25,36 @@ import glob
 import pandas as pd
 import numpy as np
 
-DATA_FOLDER = "./garmin_data"
+DATA_FOLDER = os.environ.get("GARMIN_DATA_PATH", "./garmin_data")
+
+
+def _discover_files(folder_path: str) -> dict:
+    """
+    Discover Garmin JSON files in both flat and nested (DI_CONNECT) export layouts.
+    Returns dict with keys: uds, sleep, menstrual_cycles and lists of file paths.
+    """
+    out = {"uds": [], "sleep": [], "menstrual_cycles": []}
+
+    # Flat layout (files directly in folder)
+    out["uds"] = glob.glob(os.path.join(folder_path, "*UDSFile*.json"))
+    out["sleep"] = glob.glob(os.path.join(folder_path, "*sleepData*.json"))
+    out["menstrual_cycles"] = glob.glob(os.path.join(folder_path, "*MenstrualCycles*.json"))
+
+    # Nested layout (Garmin full export: DI_CONNECT/...)
+    agg = os.path.join(folder_path, "DI_CONNECT", "DI-Connect-Aggregator")
+    wellness = os.path.join(folder_path, "DI_CONNECT", "DI-Connect-Wellness")
+    if os.path.isdir(agg):
+        out["uds"] = list(set(out["uds"]) | set(glob.glob(os.path.join(agg, "*UDSFile*.json"))))
+    if os.path.isdir(wellness):
+        out["sleep"] = list(set(out["sleep"]) | set(glob.glob(os.path.join(wellness, "*sleepData*.json"))))
+        out["menstrual_cycles"] = list(set(out["menstrual_cycles"]) | set(glob.glob(os.path.join(wellness, "*MenstrualCycles*.json"))))
+
+    return out
 
 
 def _load_wellness_uds(folder_path: str) -> pd.DataFrame:
     """Load and preprocess daily wellness data from *UDSFile*.json."""
-    file_pattern = os.path.join(folder_path, "*UDSFile*.json")
-    files = glob.glob(file_pattern)
+    files = _discover_files(folder_path)["uds"]
 
     if not files:
         raise FileNotFoundError(f"No UDSFile JSON files found in {folder_path}")
@@ -44,6 +71,7 @@ def _load_wellness_uds(folder_path: str) -> pd.DataFrame:
 
     for file in files:
         try:
+            file_mtime = os.path.getmtime(file)
             with open(file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
@@ -52,12 +80,15 @@ def _load_wellness_uds(folder_path: str) -> pd.DataFrame:
             elif isinstance(data, dict):
                 if "dailyData" in data and isinstance(data["dailyData"], list):
                     temp = pd.json_normalize(data["dailyData"], meta=common_meta, errors="ignore")
+                elif "dailySummaries" in data and isinstance(data["dailySummaries"], list):
+                    temp = pd.json_normalize(data["dailySummaries"], meta=common_meta, errors="ignore")
                 else:
                     temp = pd.json_normalize(data, meta=common_meta, errors="ignore")
             else:
                 continue
 
             if not temp.empty:
+                temp["_source_mtime"] = file_mtime
                 df_list.append(temp)
         except Exception as e:
             print(f"Warning: could not read {file}: {e}")
@@ -67,7 +98,9 @@ def _load_wellness_uds(folder_path: str) -> pd.DataFrame:
 
     df = pd.concat(df_list, ignore_index=True)
     df["calendarDate"] = pd.to_datetime(df["calendarDate"], errors="coerce")
-    df = df.sort_values("calendarDate").drop_duplicates(subset=["calendarDate"], keep="last").reset_index(drop=True)
+    # Prefer newer files when dates overlap (keep row from most recently modified file)
+    df = df.sort_values(["calendarDate", "_source_mtime"], ascending=[True, False]).drop_duplicates(subset=["calendarDate"], keep="first").reset_index(drop=True)
+    df = df.drop(columns=["_source_mtime"], errors="ignore")
 
     # Column names
     df.columns = df.columns.str.strip().str.replace(".", "_", regex=False)
@@ -96,12 +129,16 @@ def _load_wellness_uds(folder_path: str) -> pd.DataFrame:
         df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Physiological filters
-    df = df[df["restingHeartRate"].between(35, 90)]
+    # Keep partial days (e.g. today): only reject implausible values when present, never drop the row.
+    m_rhr = df["restingHeartRate"].notna()
+    df = df[(~m_rhr) | (df["restingHeartRate"].between(35, 90))]
     if "avgRespiration" in df.columns:
-        df = df[df["avgRespiration"].between(8, 25)]
-    df = df[df["totalSteps"] >= 0]
-    df = df[df["totalDistanceMeters"] >= 0]
+        m_ar = df["avgRespiration"].notna()
+        df = df[(~m_ar) | (df["avgRespiration"].between(8, 25))]
+    m_ts = df["totalSteps"].notna()
+    df = df[(~m_ts) | (df["totalSteps"] >= 0)]
+    m_td = df["totalDistanceMeters"].notna()
+    df = df[(~m_td) | (df["totalDistanceMeters"] >= 0)]
 
     # Engineered daily metrics
     df["totalDistance_km"] = df["totalDistanceMeters"] / 1000
@@ -158,8 +195,7 @@ def _load_wellness_uds(folder_path: str) -> pd.DataFrame:
 
 def _load_sleep(folder_path: str) -> pd.DataFrame:
     """Load and preprocess sleep data from *sleepData*.json."""
-    file_pattern = os.path.join(folder_path, "*sleepData*.json")
-    files = glob.glob(file_pattern)
+    files = _discover_files(folder_path)["sleep"]
 
     if not files:
         return pd.DataFrame(columns=["Date", "total_sleep_hours", "avgSleepStress"])
@@ -167,17 +203,21 @@ def _load_sleep(folder_path: str) -> pd.DataFrame:
     df_list = []
     for file in files:
         try:
+            file_mtime = os.path.getmtime(file)
             with open(file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             if isinstance(data, list):
                 temp = pd.json_normalize(data)
             elif isinstance(data, dict):
-                temp = pd.json_normalize(data["sleepData"]) if "sleepData" in data else pd.json_normalize(data)
+                if "sleepData" in data and isinstance(data["sleepData"], list):
+                    temp = pd.json_normalize(data["sleepData"])
+                else:
+                    temp = pd.json_normalize(data)
             else:
                 continue
 
-            temp["source_file"] = os.path.basename(file)
+            temp["_source_mtime"] = file_mtime
             df_list.append(temp)
         except Exception as e:
             print(f"Warning: could not read {file}: {e}")
@@ -188,27 +228,36 @@ def _load_sleep(folder_path: str) -> pd.DataFrame:
     df = pd.concat(df_list, ignore_index=True)
     df.columns = df.columns.str.replace(".", "_", regex=False)
     df["calendarDate"] = pd.to_datetime(df["calendarDate"], errors="coerce")
-    df = df.sort_values("calendarDate").drop_duplicates(subset=["calendarDate"], keep="last")
+    df = df.sort_values(["calendarDate", "_source_mtime"], ascending=[True, False]).drop_duplicates(subset=["calendarDate"], keep="first").reset_index(drop=True)
+    df = df.drop(columns=["_source_mtime"], errors="ignore")
 
-    # Filter OFF_WRIST
-    if "sleepWindowConfirmationType" in df.columns:
-        df = df[df["sleepWindowConfirmationType"] != "OFF_WRIST"]
-
-    cols = ["calendarDate", "deepSleepSeconds", "remSleepSeconds", "lightSleepSeconds", "awakeSleepSeconds", "averageRespiration", "avgSleepStress"]
+    cols = ["calendarDate", "deepSleepSeconds", "remSleepSeconds", "lightSleepSeconds", "awakeSleepSeconds", "averageRespiration", "avgSleepStress", "sleepWindowConfirmationType"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols].copy()
     df = df.dropna(subset=["calendarDate"])
 
+    for c in ["deepSleepSeconds", "remSleepSeconds", "lightSleepSeconds", "awakeSleepSeconds"]:
+        if c not in df.columns:
+            df[c] = 0.0
+        else:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
     df["total_sleep_sec"] = df["deepSleepSeconds"] + df["remSleepSeconds"] + df["lightSleepSeconds"]
-    df["total_sleep_hours"] = df["total_sleep_sec"] / 3600
-
-    df = df[(df["total_sleep_hours"] >= 3) & (df["total_sleep_hours"] <= 12)]
+    df["total_sleep_hours"] = np.where(df["total_sleep_sec"] > 0, df["total_sleep_sec"] / 3600.0, np.nan)
+    if "sleepWindowConfirmationType" in df.columns:
+        df.loc[df["sleepWindowConfirmationType"].astype(str) == "OFF_WRIST", "total_sleep_hours"] = np.nan
+    _ok = df["total_sleep_hours"].isna() | ((df["total_sleep_hours"] >= 3) & (df["total_sleep_hours"] <= 12))
+    df.loc[~_ok, "total_sleep_hours"] = np.nan
     if "averageRespiration" in df.columns:
-        df = df[(df["averageRespiration"] >= 8) & (df["averageRespiration"] <= 25)]
+        ar = pd.to_numeric(df["averageRespiration"], errors="coerce")
+        bad = ar.notna() & ((ar < 8) | (ar > 25))
+        ar = ar.where(~bad, np.nan)
+        df["averageRespiration"] = ar
 
-    df["deep_ratio"] = df["deepSleepSeconds"] / df["total_sleep_sec"]
-    df["rem_ratio"] = df["remSleepSeconds"] / df["total_sleep_sec"]
-    df["fragmentation_ratio"] = df["awakeSleepSeconds"] / (df["total_sleep_sec"] + df["awakeSleepSeconds"])
+    df["deep_ratio"] = np.where(df["total_sleep_sec"] > 0, df["deepSleepSeconds"] / df["total_sleep_sec"], np.nan)
+    df["rem_ratio"] = np.where(df["total_sleep_sec"] > 0, df["remSleepSeconds"] / df["total_sleep_sec"], np.nan)
+    _den = df["total_sleep_sec"] + df["awakeSleepSeconds"]
+    df["fragmentation_ratio"] = np.where(_den > 0, df["awakeSleepSeconds"] / _den, np.nan)
 
     df = df.sort_values("calendarDate")
     if "averageRespiration" in df.columns:
@@ -221,8 +270,13 @@ def _load_sleep(folder_path: str) -> pd.DataFrame:
     df["sleep_debt"] = TARGET_SLEEP - df["total_sleep_hours"]
     df["sleep_debt_3day"] = df["sleep_debt"].rolling(3, min_periods=1).sum()
 
-    df["sleepStress_7day_avg"] = df["avgSleepStress"].rolling(7, min_periods=3).mean()
-    df["sleepStress_delta"] = df["avgSleepStress"] - df["sleepStress_7day_avg"]
+    if "avgSleepStress" in df.columns:
+        df["sleepStress_7day_avg"] = df["avgSleepStress"].rolling(7, min_periods=3).mean()
+        df["sleepStress_delta"] = df["avgSleepStress"] - df["sleepStress_7day_avg"]
+    else:
+        df["avgSleepStress"] = np.nan
+        df["sleepStress_7day_avg"] = np.nan
+        df["sleepStress_delta"] = np.nan
 
     df["Date"] = df["calendarDate"] + pd.Timedelta(days=1)
 
@@ -241,37 +295,80 @@ def _load_sleep(folder_path: str) -> pd.DataFrame:
 
 def _load_cycle(folder_path: str) -> pd.DataFrame:
     """Load and preprocess menstrual cycle data from *MenstrualCycles*.json."""
-    pattern = os.path.join(folder_path, "*MenstrualCycles*.json")
-    files = glob.glob(pattern)
+    files = _discover_files(folder_path)["menstrual_cycles"]
     if not files:
         return pd.DataFrame(columns=["Date", "cycleDay", "cyclePhase", "cycleProgress", "daysUntilNextPeriod"])
 
-    with open(files[0], "r", encoding="utf-8") as f:
-        data = json.load(f)
+    df_list = []
+    for file in files:
+        try:
+            file_mtime = os.path.getmtime(file)
+            with open(file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                temp = pd.json_normalize(data)
+            elif isinstance(data, dict):
+                if "cycles" in data:
+                    temp = pd.json_normalize(data["cycles"])
+                elif "menstrualCycles" in data:
+                    temp = pd.json_normalize(data["menstrualCycles"])
+                elif "dailyData" in data:
+                    temp = pd.json_normalize(data["dailyData"])
+                else:
+                    temp = pd.json_normalize(data)
+            else:
+                continue
+            if not temp.empty and "startDate" in temp.columns:
+                temp["_source_mtime"] = file_mtime
+                df_list.append(temp)
+        except Exception as e:
+            print(f"Warning: could not read {file}: {e}")
 
-    if isinstance(data, list):
-        df = pd.json_normalize(data)
-    elif isinstance(data, dict):
-        if "cycles" in data:
-            df = pd.json_normalize(data["cycles"])
-        elif "menstrualCycles" in data:
-            df = pd.json_normalize(data["menstrualCycles"])
-        elif "dailyData" in data:
-            df = pd.json_normalize(data["dailyData"])
-        else:
-            df = pd.json_normalize(data)
-    else:
-        raise ValueError("Unknown cycle JSON structure")
+    if not df_list:
+        return pd.DataFrame(columns=["Date", "cycleDay", "cyclePhase", "cycleProgress", "daysUntilNextPeriod"])
 
-    cols = ["startDate", "actualCycleLength", "actualPeriodLength", "fertileWindowStart", "fertileWindowLength"]
+    df = pd.concat(df_list, ignore_index=True)
+    df["startDate"] = pd.to_datetime(df["startDate"], errors="coerce")
+    df = df.dropna(subset=["startDate"])
+    df = df.sort_values(["startDate", "_source_mtime"], ascending=[True, False]).drop_duplicates(subset=["startDate"], keep="first").reset_index(drop=True)
+    df = df.drop(columns=["_source_mtime"], errors="ignore")
+
+    cols = ["startDate", "actualCycleLength", "actualPeriodLength", "applicableMenstrualCycleLength",
+            "applicablePeriodLength", "fertileWindowStart", "fertileWindowLength"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols].copy()
     df["startDate"] = pd.to_datetime(df["startDate"], errors="coerce")
     df = df.dropna(subset=["startDate"])
 
-    for col in ["actualCycleLength", "actualPeriodLength", "fertileWindowStart", "fertileWindowLength"]:
+    for col in ["actualCycleLength", "actualPeriodLength", "applicableMenstrualCycleLength",
+                "applicablePeriodLength", "fertileWindowStart", "fertileWindowLength"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+    # Garmin export: use applicable* as fallback when actual* is missing (e.g. CURRENT cycle)
+    if "actualCycleLength" not in df.columns and "applicableMenstrualCycleLength" in df.columns:
+        df["actualCycleLength"] = df["applicableMenstrualCycleLength"]
+    elif "actualCycleLength" in df.columns and "applicableMenstrualCycleLength" in df.columns:
+        df["actualCycleLength"] = df["actualCycleLength"].fillna(df["applicableMenstrualCycleLength"])
+    if "actualPeriodLength" not in df.columns and "applicablePeriodLength" in df.columns:
+        df["actualPeriodLength"] = df["applicablePeriodLength"]
+    elif "actualPeriodLength" in df.columns and "applicablePeriodLength" in df.columns:
+        df["actualPeriodLength"] = df["actualPeriodLength"].fillna(df["applicablePeriodLength"])
+
+    # fertileWindowStart can be missing for some cycles (Garmin export)
+    default_fw_start = np.where(
+        df["actualCycleLength"].notna(),
+        np.ceil(df["actualCycleLength"] * 0.5).astype(float),
+        14.0,
+    )
+    if "fertileWindowStart" not in df.columns:
+        df["fertileWindowStart"] = default_fw_start
+    else:
+        df["fertileWindowStart"] = df["fertileWindowStart"].fillna(
+            pd.Series(default_fw_start, index=df.index)
+        )
+    if "fertileWindowLength" not in df.columns:
+        df["fertileWindowLength"] = 7
 
     df = df.sort_values("startDate").reset_index(drop=True)
     start_date = df["startDate"].min()
@@ -351,7 +448,7 @@ def build_daily_master(data_folder: str | None = None, export_path: str | None =
 
     print("Building daily master dataset...")
     df_daily_master = df_daily.merge(df_sleep, on="Date", how="outer", suffixes=("_physio", "_sleep"))
-    df_daily_master = df_daily_master.merge(df_cycle, on="Date", how="outer")
+    df_daily_master = df_daily_master.merge(df_cycle, on="Date", how="left")
     df_daily_master = df_daily_master.sort_values("Date").reset_index(drop=True)
 
     if export_path:

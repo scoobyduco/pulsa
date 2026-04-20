@@ -1,18 +1,14 @@
-# Python
+*.xlsx
+*.csv
+user_settings.json
+*.json
+garmin_data/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-.venv/
-env/
-
-# macOS
-.DS_Store
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+*.pyc
+.env
+old/
+figures/
+*.png
+*.html
+*.pdf
+*.md
