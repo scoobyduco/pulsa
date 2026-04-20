@@ -1,0 +1,27 @@
+{
+  "profile": {
+    "name": "Colombina",
+    "age": 30
+  },
+  "training": {
+    "baseline_km": 20,
+    "experience": "Intermediate",
+    "goal": "General fitness",
+    "has_race": false,
+    "days_per_week": 4,
+    "race_dist_sel": "Marathon (42 km)",
+    "race_dist_custom": 15,
+    "goal_time": "3:30",
+    "race_date": "2026-06-30"
+  },
+  "cycle": {
+    "use_garmin_cycle": false,
+    "cycle_length": 28,
+    "last_period_start": "2026-04-03"
+  },
+  "garmin": {
+    "email": "colombina.duco@gmail.com",
+    "data_folder": "garmin_data",
+    "last_sync": null
+  }
+}
