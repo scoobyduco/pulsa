@@ -11,16 +11,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from plan_engine import calculate_vdot, generate_plan
+
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Pulsa API", version="1.0.0")
+app = FastAPI(title="Pulsa API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +34,22 @@ app.add_middleware(
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(BASE_DIR, "user_settings.json")
+DEBRIEF_PATH = os.path.join(BASE_DIR, "workout_debriefs.json")
+
+# Garmin keeps counting cycle days when a period isn't logged, so a missed
+# log produces "day 200" rows that all fall into Luteal. Treat them as unknown.
+MAX_CYCLE_DAY = 45
+
+
+def _sanitize_cycle(df: pd.DataFrame) -> pd.DataFrame:
+    if "cycleDay" not in df.columns:
+        return df
+    bad = pd.to_numeric(df["cycleDay"], errors="coerce") > MAX_CYCLE_DAY
+    for col in ("cycleDay", "cyclePhase", "cycleProgress", "daysUntilNextPeriod"):
+        if col in df.columns:
+            df.loc[bad, col] = np.nan
+    return df
 
 
 def _load() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -50,6 +69,7 @@ def _load() -> tuple[pd.DataFrame, pd.DataFrame]:
     for df in (daily, running):
         if "Date" in df.columns:
             df["Date"] = pd.to_datetime(df["Date"])
+        _sanitize_cycle(df)
 
     return daily, running
 
@@ -58,11 +78,44 @@ _daily_df, _running_df = _load()
 
 
 def daily() -> pd.DataFrame:
+    if "Date" not in _daily_df.columns:
+        return _daily_df
     return _daily_df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
 
 
 def runs() -> pd.DataFrame:
-    return _running_df.sort_values("Date")
+    """Actual runs only. running_engine_output has one row per day; non-run days have no distance."""
+    r = _running_df
+    if "Date" not in r.columns:
+        return r
+    if "distance_km" in r.columns:
+        r = r[pd.to_numeric(r["distance_km"], errors="coerce") > 0]
+    return r.sort_values("Date")
+
+
+def _today() -> date:
+    """Indirection so tests can pin the date."""
+    return date.today()
+
+
+def _settings() -> dict:
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH) as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _parse_date(v: Any) -> date | None:
+    if not v:
+        return None
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -89,57 +142,56 @@ def _safe(val: Any, default: Any = None) -> Any:
     return val
 
 
-def _latest_row(df: pd.DataFrame) -> pd.Series:
-    if len(df) == 0:
-        return pd.Series(dtype=object)
-    return df.iloc[-1]
-
-
-def _resolve_phase(df: pd.DataFrame) -> str:
-    """Get current cycle phase from latest data row."""
-    for col in ("cyclePhase", "cycle_phase"):
+def _latest_value(df: pd.DataFrame, *cols: str) -> Any:
+    """Most recent non-null value of the first column that has one.
+    The latest row is often a partial day (e.g. no resting HR yet)."""
+    for col in cols:
         if col in df.columns:
-            recent = df.dropna(subset=[col]).tail(14)
-            for _, row in recent.iloc[::-1].iterrows():
-                v = str(row[col]).strip()
-                if v in PHASE_ORDER:
-                    return v
-    # Fallback: compute from user_settings.json if available
-    settings_path = os.path.join(BASE_DIR, "user_settings.json")
-    if os.path.exists(settings_path):
-        with open(settings_path) as f:
-            s = json.load(f)
-        lps_str = s.get("cycle", {}).get("last_period_start")
-        cl = int(s.get("cycle", {}).get("cycle_length", 28))
-        if lps_str:
-            lps = date.fromisoformat(lps_str)
-            cd = (date.today() - lps).days % cl + 1
-            if cd <= 5:
-                return "Menstrual"
-            if cd <= int(cl * 0.5):
-                return "Follicular"
-            if cd <= int(cl * 0.65):
-                return "Ovulatory"
-            return "Luteal"
-    return "Follicular"
+            s = df[col].dropna()
+            if len(s):
+                return s.iloc[-1]
+    return None
 
 
-def _resolve_cycle_day(df: pd.DataFrame) -> int:
-    for col in ("cycleDay", "cycle_day"):
+def _cycle_length(df: pd.DataFrame) -> int:
+    for col in ("actualCycleLength", "applicableMenstrualCycleLength"):
         if col in df.columns:
-            recent = df.dropna(subset=[col]).tail(5)
-            if len(recent):
-                return int(float(recent.iloc[-1][col]))
-    settings_path = os.path.join(BASE_DIR, "user_settings.json")
-    if os.path.exists(settings_path):
-        with open(settings_path) as f:
-            s = json.load(f)
-        lps_str = s.get("cycle", {}).get("last_period_start")
-        cl = int(s.get("cycle", {}).get("cycle_length", 28))
-        if lps_str:
-            lps = date.fromisoformat(lps_str)
-            return (date.today() - lps).days % cl + 1
-    return 14
+            v = df[col].dropna().tail(1)
+            if len(v) and 21 <= float(v.iloc[0]) <= 45:
+                return int(round(float(v.iloc[0])))
+    try:
+        cl = int(_settings().get("cycle", {}).get("cycle_length", 28))
+    except (TypeError, ValueError):
+        cl = 28
+    return int(max(21, min(cl, 45)))
+
+
+def _cycle_anchor(df: pd.DataFrame) -> date | None:
+    """Start date of the most recent known period.
+
+    Respects user_settings.cycle.use_garmin_cycle: when false the manually
+    entered last_period_start wins; otherwise the Garmin cycle data does.
+    Each source falls back to the other.
+    """
+    cyc = _settings().get("cycle", {})
+    manual = _parse_date(cyc.get("last_period_start"))
+
+    garmin = None
+    if "cycleDay" in df.columns and "Date" in df.columns:
+        known = df.dropna(subset=["cycleDay"])
+        if len(known):
+            row = known.iloc[-1]
+            garmin = pd.Timestamp(row["Date"]).date() - timedelta(days=int(float(row["cycleDay"])) - 1)
+
+    if cyc.get("use_garmin_cycle", False):
+        return garmin or manual
+    return manual or garmin
+
+
+def _cycle_day_on(day: date, anchor: date | None, cl: int) -> int:
+    if anchor is None:
+        return 14
+    return (day - anchor).days % cl + 1
 
 
 def _phase_day_bounds(cycle_length: int = 28) -> dict:
@@ -155,40 +207,181 @@ def _phase_day_bounds(cycle_length: int = 28) -> dict:
     }
 
 
-def _cycle_length(df: pd.DataFrame) -> int:
-    for col in ("actualCycleLength", "applicableMenstrualCycleLength"):
-        if col in df.columns:
-            v = df[col].dropna().tail(1)
-            if len(v) and 21 <= float(v.iloc[0]) <= 45:
-                return int(round(float(v.iloc[0])))
-    settings_path = os.path.join(BASE_DIR, "user_settings.json")
-    if os.path.exists(settings_path):
-        with open(settings_path) as f:
-            return int(json.load(f).get("cycle", {}).get("cycle_length", 28))
-    return 28
+def _phase_for_day(cycle_day: int, cl: int) -> str:
+    for ph, (ps, pe) in _phase_day_bounds(cl).items():
+        if ps <= cycle_day <= pe:
+            return ph
+    return "Luteal"
+
+
+def _cycle_state(df: pd.DataFrame, day: date | None = None) -> dict:
+    """Single source of truth for 'where am I in my cycle' across endpoints."""
+    day = day or _today()
+    cl = _cycle_length(df)
+    anchor = _cycle_anchor(df)
+    cd = _cycle_day_on(day, anchor, cl)
+    return {"anchor": anchor, "cycleLength": cl, "cycleDay": cd, "phase": _phase_for_day(cd, cl)}
+
+
+def _resolve_phase(df: pd.DataFrame) -> str:
+    return _cycle_state(df)["phase"]
+
+
+def _data_as_of(df: pd.DataFrame) -> str | None:
+    if "Date" not in df.columns or not len(df):
+        return None
+    return str(pd.Timestamp(df["Date"].max()).date())
+
+
+# ─── Plan building (shared by /plan, /today, /workout) ────────────────────────
+WTYPE_EMOJI = {
+    "easy": "🏃‍♀️", "tempo": "⚡", "interval": "🔥", "long": "🛤️",
+    "fartlek": "🎢", "hills": "⛰️", "race": "🏁", "rest": "🧘",
+}
+WTYPE_LABEL = {
+    "easy": "Easy run", "tempo": "Tempo run", "interval": "Intervals", "long": "Long run",
+    "fartlek": "Fartlek", "hills": "Hill repeats", "race": "Race day", "rest": "Rest",
+}
+WTYPE_EFFORT = {
+    "easy": "Easy", "long": "Moderate", "tempo": "Hard", "interval": "Very hard",
+    "fartlek": "Hard", "hills": "Hard", "race": "Race", "rest": "Recovery",
+}
+QUALITY_TYPES = {"tempo", "interval", "fartlek", "hills"}
+DAY_KEYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DIST_MAP = {"5 km": "5k", "10 km": "10k",
+            "Half marathon (21 km)": "21k", "Marathon (42 km)": "42k"}
+
+
+def _vdot_from_runs(r: pd.DataFrame, days: int = 180) -> float | None:
+    """Fitness estimate from recent runs. Training runs understate race fitness,
+    so take the 90th percentile rather than the median. None → plan_engine estimates from volume."""
+    if not {"distance_km", "duration_min", "Date"} <= set(r.columns):
+        return None
+    sub = r[(r["distance_km"] >= 3) & (r["duration_min"] > 0)]
+    sub = sub[sub["Date"] >= sub["Date"].max() - pd.Timedelta(days=days)] if len(sub) else sub
+    if len(sub) < 5:
+        return None
+    vdots = [calculate_vdot(int(m * 60), float(k)) for m, k in zip(sub["duration_min"], sub["distance_km"])]
+    return round(float(np.percentile(vdots, 90)), 1)
+
+
+def _build_plan(d: pd.DataFrame) -> dict:
+    """Generate the plan from user settings and map the current week to API rows."""
+    today = _today()
+    cyc = _cycle_state(d, today)
+    cl, anchor = cyc["cycleLength"], cyc["anchor"]
+
+    tr = _settings().get("training", {})
+    has_race  = bool(tr.get("has_race", False))
+    race_dist = tr.get("race_dist_sel", "10 km")
+    baseline  = float(tr.get("baseline_km", 25) or 25)
+    rpw       = int(tr.get("days_per_week", 4) or 4)
+    goal_time = tr.get("goal_time", "") or ""
+
+    race_date_obj = _parse_date(tr.get("race_date")) if has_race else None
+    # A race in the past can't be trained for — fall back to maintenance.
+    if race_date_obj and race_date_obj < today:
+        race_date_obj = None
+        has_race = False
+
+    if has_race and race_dist == "Custom":
+        km = float(tr.get("race_dist_custom", 10) or 10)
+        goal_type = "5k" if km <= 7 else "10k" if km <= 15 else "21k" if km <= 30 else "42k"
+    else:
+        goal_type = DIST_MAP.get(race_dist, "10k") if has_race else "maintenance"
+
+    fp = generate_plan(
+        goal_type=goal_type,
+        goal_time_str=goal_time if has_race else "",
+        baseline_km=baseline,
+        runs_per_week=rpw,
+        current_vdot=_vdot_from_runs(runs()),
+        race_date=race_date_obj,
+        today=today,
+        last_period_start=anchor,
+        cycle_length=cl,
+    )
+
+    cur_week = fp["weeks"][0] if fp.get("weeks") else {}
+    days_map = cur_week.get("days", {})
+
+    week = []
+    monday = today - timedelta(days=today.weekday())
+    for i, day_key in enumerate(DAY_KEYS):
+        wo = days_map.get(day_key, {"type": "rest", "km": 0})
+        wt = str(wo.get("type", "rest")).lower()
+        day_date = monday + timedelta(days=i)
+        day_phase = _phase_for_day(_cycle_day_on(day_date, anchor, cl), cl)
+        week.append({
+            "workoutId":  f"{day_key}_{day_date.isoformat()}",
+            "date":       str(day_date),
+            "dayName":    day_key,
+            "type":       wt,
+            "emoji":      WTYPE_EMOJI.get(wt, "🏃‍♀️"),
+            "distanceKm": float(wo.get("km", 0) or 0),
+            "details":    wo.get("details", "") or "",
+            "isKey":      bool(wo.get("is_key", False)),
+            "phase":      day_phase,
+            "phaseColor": PHASE_COLORS[day_phase],
+            "isRest":     wt == "rest",
+            "isToday":    day_date == today,
+        })
+
+    return {
+        "fp":        fp,
+        "week":      week,
+        "totalKm":   float(cur_week.get("total_km", baseline)),
+        "hasRace":   has_race,
+        "raceDist":  race_dist,
+        "raceDate":  race_date_obj,
+        "goalTime":  goal_time,
+    }
+
+
+def _paces_raw(fp: dict) -> dict:
+    raw = (fp.get("paces") or {}).get("_raw", {})
+    return {
+        "easy":     float(raw.get("easy_fast", 378)),
+        "easy_slow": float(raw.get("easy_slow", 409)),
+        "tempo":    float(raw.get("tempo", 320)),
+        "interval": float(raw.get("interval", 295)),
+        "mp":       float(raw.get("mp", 341)),
+    }
+
+
+def _estimate_minutes(wt: str, km: float, paces: dict) -> int:
+    """Rough total time: easy-pace km plus a faster share for quality days."""
+    if wt == "rest" or km <= 0:
+        return 0
+    sec_per_km = {
+        "easy": paces["easy"], "long": paces["easy_slow"],
+        "tempo": 0.6 * paces["easy"] + 0.4 * paces["tempo"],
+        "interval": 0.7 * paces["easy"] + 0.3 * paces["interval"],
+        "race": paces["mp"],
+    }.get(wt, paces["easy"])
+    return max(1, int(round(km * sec_per_km / 60)))
 
 
 # ─── /today ───────────────────────────────────────────────────────────────────
 @app.get("/today")
 def get_today():
     d = daily()
+    today = _today()
 
-    latest = _latest_row(d)
-    phase = _resolve_phase(d)
-    cycle_day = _resolve_cycle_day(d)
-    cl = _cycle_length(d)
+    cyc = _cycle_state(d, today)
+    phase, cycle_day, cl = cyc["phase"], cyc["cycleDay"], cyc["cycleLength"]
     bounds = _phase_day_bounds(cl)
 
-    # Metrics
-    rhr_today = _safe(latest.get("restingHeartRate") or latest.get("resting_hr"))
-    readiness = _safe(latest.get("readiness_score"))
-    sleep_h   = _safe(latest.get("total_sleep_hours"))
+    # Metrics (latest known value, the newest row is often a partial day)
+    rhr_today = _safe(_latest_value(d, "restingHeartRate", "resting_hr"))
+    readiness = _safe(_latest_value(d, "readiness_score"))
+    sleep_h   = _safe(_latest_value(d, "total_sleep_hours"))
 
     baseline_30 = d.tail(30)
-    rhr_base  = float(baseline_30["restingHeartRate"].mean()) if "restingHeartRate" in baseline_30.columns else None
-    rdy_base  = float(baseline_30["readiness_score"].mean())  if "readiness_score" in baseline_30.columns else None
-    hr_delta  = (float(rhr_today) - rhr_base) if rhr_today and rhr_base else 0.0
-    rdy_delta = (float(readiness) - rdy_base) if readiness and rdy_base else 0.0
+    rhr_base  = _safe(float(baseline_30["restingHeartRate"].mean())) if "restingHeartRate" in baseline_30.columns else None
+    rdy_base  = _safe(float(baseline_30["readiness_score"].mean()))  if "readiness_score" in baseline_30.columns else None
+    hr_delta  = (float(rhr_today) - rhr_base) if rhr_today is not None and rhr_base is not None else 0.0
+    rdy_delta = (float(readiness) - rdy_base) if readiness is not None and rdy_base is not None else 0.0
 
     def hr_ctx(delta):
         if abs(delta) <= 3:
@@ -211,29 +404,45 @@ def get_today():
             return "Slightly lower"
         return "Lower than usual"
 
-    # Recommendation
-    phase_rec = {
-        "Menstrual":  ("easy",     "Easy run",    5.0, 35, "Easy",      "Hormones are at their lowest — go easy and protect your energy."),
-        "Follicular": ("tempo",    "Tempo run",   8.0, 45, "Hard",      "Estrogen is rising — a great window to push quality."),
-        "Ovulatory":  ("interval", "Intervals",   6.0, 40, "Very hard", "Peak estrogen — your strongest window. Go for it."),
-        "Luteal":     ("easy",     "Steady run",  7.0, 45, "Moderate",  "Progesterone raises your HR — go by effort, not pace."),
+    # Recommendation: today's slot from the plan, with phase-aware coaching copy
+    phase_body = {
+        "Menstrual":  "Hormones are at their lowest — go easy and protect your energy.",
+        "Follicular": "Estrogen is rising — a great window to push quality.",
+        "Ovulatory":  "Peak estrogen — your strongest window. Go for it.",
+        "Luteal":     "Progesterone raises your HR — go by effort, not pace.",
     }
-    rec_type, rec_title, rec_dist, rec_dur, rec_effort, rec_body = phase_rec[phase]
+    try:
+        plan = _build_plan(d)
+    except Exception:  # bad training settings shouldn't take down the home screen
+        plan = {"fp": {}, "week": []}
+    paces = _paces_raw(plan["fp"])
+    slot = next((w for w in plan["week"] if w["isToday"]), None) or {"type": "rest", "distanceKm": 0.0}
+    rec_type = slot["type"]
+    rec_dist = float(slot["distanceKm"])
+    rec_body = phase_body[phase]
+
+    if rec_type == "rest":
+        rec_body = "Rest day — recovery is where the training turns into fitness."
+    elif rec_type in QUALITY_TYPES and readiness is not None and float(readiness) < 60:
+        # Cycle adjusts effort, readiness can too — keep the session, drop the intensity.
+        rec_type = "easy"
+        rec_body = "Recovery signals are low today — keep the run but make it easy."
+    elif rec_type in QUALITY_TYPES and phase in ("Menstrual", "Luteal"):
+        rec_body = f"{phase_body[phase]} Keep the session, adjust the effort."
 
     # Recovery trend (7 days)
-    trend_7 = d.tail(7)
+    trend_7 = d.dropna(subset=["readiness_score"]).tail(7) if "readiness_score" in d.columns else d.iloc[0:0]
     recovery_trend = []
     for _, row in trend_7.iterrows():
-        ph = str(row.get("cyclePhase") or row.get("cycle_phase") or phase)
-        rdy = _safe(row.get("readiness_score"), 60)
+        ph = _safe(row.get("cyclePhase")) or _safe(row.get("cycle_phase")) or phase
         recovery_trend.append({
             "date":      str(pd.Timestamp(row["Date"]).date()),
-            "readiness": float(rdy),
-            "phase":     ph,
+            "readiness": float(row["readiness_score"]),
+            "phase":     str(ph),
         })
 
     # Trend insight
-    rdys = [x["readiness"] for x in recovery_trend if x["readiness"]]
+    rdys = [x["readiness"] for x in recovery_trend]
     if len(rdys) >= 2:
         if rdys[-1] > rdys[0] + 3:
             trend_insight = "Recovery climbing steadily this week — a supportive pattern."
@@ -259,7 +468,7 @@ def get_today():
 
     # Coming next
     next_phase = PHASE_ORDER[(PHASE_ORDER.index(phase) + 1) % 4]
-    cur_start, cur_end = bounds[phase]
+    _, cur_end = bounds[phase]
     days_to_next = max(1, cur_end - cycle_day + 1)
     next_blurbs = {
         "Menstrual":  "Energy often dips as hormones reset.",
@@ -268,34 +477,33 @@ def get_today():
         "Luteal":     "Effort may feel higher at the same pace.",
     }
 
-    # Greeting name
-    name = "Runner"
-    settings_path = os.path.join(BASE_DIR, "user_settings.json")
-    if os.path.exists(settings_path):
-        with open(settings_path) as f:
-            name = json.load(f).get("profile", {}).get("name", "Runner") or "Runner"
+    name = _settings().get("profile", {}).get("name") or "Runner"
+    data_as_of = _data_as_of(d)
 
     return {
         "greetingName": name,
         "cycleDay":     cycle_day,
         "cyclePhase":   phase,
         "phaseColor":   PHASE_COLORS[phase],
-        "todayDate":    date.today().strftime("%-d %b"),
+        "todayDate":    f"{today.day} {today.strftime('%b')}",
         "phaseNote":    next_blurbs.get(phase, ""),
+        "dataAsOf":     data_as_of,
+        "dataStale":    bool(data_as_of) and (today - date.fromisoformat(data_as_of)).days > 2,
         "recommendation": {
             "type":        rec_type,
-            "title":       rec_title,
+            "title":       WTYPE_LABEL.get(rec_type, rec_type.capitalize()),
             "distanceKm":  rec_dist,
-            "durationMin": rec_dur,
-            "effortLevel": rec_effort,
+            "durationMin": _estimate_minutes(rec_type, rec_dist, paces),
+            "effortLevel": WTYPE_EFFORT.get(rec_type, "Moderate"),
             "body":        rec_body,
+            "workoutId":   slot.get("workoutId"),
         },
         "metrics": {
-            "restingHr":        int(rhr_today) if rhr_today else None,
+            "restingHr":        int(rhr_today) if rhr_today is not None else None,
             "restingHrContext": hr_ctx(hr_delta),
-            "sleepHours":       round(float(sleep_h), 1) if sleep_h else None,
+            "sleepHours":       round(float(sleep_h), 1) if sleep_h is not None else None,
             "sleepContext":     sleep_ctx(sleep_h),
-            "readinessScore":   int(readiness) if readiness else None,
+            "readinessScore":   int(readiness) if readiness is not None else None,
             "readinessContext": rdy_ctx(rdy_delta),
         },
         "recoveryTrend":  recovery_trend,
@@ -317,120 +525,33 @@ def get_today():
 # ─── /plan ────────────────────────────────────────────────────────────────────
 @app.get("/plan")
 def get_plan():
-    d = daily()
-    phase = _resolve_phase(d)
-    cycle_day = _resolve_cycle_day(d)
-    cl = _cycle_length(d)
-
+    tr = _settings().get("training", {})
     try:
-        import sys
-        sys.path.insert(0, BASE_DIR)
-        from plan_engine import generate_plan
-
-        settings_path = os.path.join(BASE_DIR, "user_settings.json")
-        s = {}
-        if os.path.exists(settings_path):
-            with open(settings_path) as f:
-                s = json.load(f)
-
-        tr = s.get("training", {})
-        has_race  = tr.get("has_race", False)
-        race_dist = tr.get("race_dist_sel", "10 km")
-        baseline  = float(tr.get("baseline_km", 25))
-        rpw       = int(tr.get("days_per_week", 4))
-        goal_time = tr.get("goal_time", "") or ""
-
-        dist_map = {"5 km": "5k", "10 km": "10k",
-                    "Half marathon (21 km)": "21k", "Marathon (42 km)": "42k"}
-        goal_type = dist_map.get(race_dist, "10k") if has_race else "maintenance"
-
-        race_date_obj = None
-        rd = tr.get("race_date")
-        if has_race and rd:
-            try:
-                race_date_obj = date.fromisoformat(str(rd))
-            except Exception:
-                pass
-
-        lps = None
-        lps_str = s.get("cycle", {}).get("last_period_start")
-        if lps_str:
-            try:
-                lps = date.fromisoformat(lps_str)
-            except Exception:
-                pass
-        if lps is None and cycle_day >= 1:
-            lps = date.today() - timedelta(days=cycle_day - 1)
-
-        fp = generate_plan(
-            goal_type=goal_type,
-            goal_time_str=goal_time,
-            baseline_km=baseline,
-            runs_per_week=rpw,
-            race_date=race_date_obj,
-            today=date.today(),
-            last_period_start=lps,
-        )
-
-        cur_week = fp["weeks"][0] if fp.get("weeks") else {}
-        days_map = cur_week.get("days", {})
-        total_km = float(cur_week.get("total_km", baseline))
-
-        WTYPE_EMOJI = {
-            "easy": "🏃‍♀️", "tempo": "⚡", "intervals": "🔥",
-            "long run": "🛤️", "rest": "🧘",
-        }
-
-        week = []
-        monday = date.today() - timedelta(days=date.today().weekday())
-        for i, day_key in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
-            wo = days_map.get(day_key, {"type": "rest", "km": 0})
-            wt = str(wo.get("type", "rest")).lower()
-            day_date = monday + timedelta(days=i)
-            day_cd = ((day_date - lps).days % cl + 1) if lps else cycle_day
-            bounds = _phase_day_bounds(cl)
-            day_phase = "Follicular"
-            for ph, (ps, pe) in bounds.items():
-                if ps <= day_cd <= pe:
-                    day_phase = ph
-                    break
-            week.append({
-                "date":       str(day_date),
-                "dayName":    day_key,
-                "type":       wt,
-                "emoji":      WTYPE_EMOJI.get(wt, "🏃‍♀️"),
-                "distanceKm": float(wo.get("km", 0) or 0),
-                "phase":      day_phase,
-                "phaseColor": PHASE_COLORS[day_phase],
-                "isRest":     wt == "rest",
-            })
-
-        run_count = sum(1 for w in week if not w["isRest"])
-
-        goal_card = {
-            "hasRace":  has_race,
-            "raceDist": race_dist,
-            "raceDate": tr.get("race_date", ""),
-            "goalTime": goal_time,
-            "weeksAway": (
-                max(0, (race_date_obj - date.today()).days // 7)
-                if race_date_obj else 0
-            ),
-        }
-
-        return {
-            "goalCard": goal_card,
-            "week":     week,
-            "totals":   {"totalKm": round(total_km, 1), "runCount": run_count},
-        }
-
+        plan = _build_plan(daily())
     except Exception as e:
         return {
-            "goalCard": {"hasRace": False, "raceDist": "10 km", "raceDate": "", "goalTime": "", "weeksAway": 0},
+            "goalCard": {"hasRace": False, "raceDist": tr.get("race_dist_sel", "10 km"),
+                         "raceDate": "", "goalTime": "", "weeksAway": 0},
             "week": [],
             "totals": {"totalKm": 0, "runCount": 0},
             "error": str(e),
         }
+
+    week = plan["week"]
+    race_date = plan["raceDate"]
+    goal_card = {
+        "hasRace":   plan["hasRace"],
+        "raceDist":  plan["raceDist"],
+        "raceDate":  race_date.isoformat() if race_date else "",
+        "goalTime":  plan["goalTime"] if plan["hasRace"] else "",
+        "weeksAway": max(0, (race_date - _today()).days // 7) if race_date else 0,
+    }
+    return {
+        "goalCard": goal_card,
+        "week":     week,
+        "totals":   {"totalKm": round(plan["totalKm"], 1),
+                     "runCount": sum(1 for w in week if not w["isRest"])},
+    }
 
 
 # ─── /insights ────────────────────────────────────────────────────────────────
@@ -442,16 +563,20 @@ def get_insights():
     cl = _cycle_length(d)
     bounds = _phase_day_bounds(cl)
 
+    # Performance columns are produced by pulsa_engine and only live in the running output
     performance_rhythm = []
     perf_col = None
     for c in ("performance_smoothed", "performance_score"):
-        if c in d.columns and d[c].notna().any():
+        if c in r.columns and r[c].notna().any():
             perf_col = c
             break
 
-    if perf_col and "cycleDay" in d.columns:
-        sub = d.dropna(subset=["cycleDay", perf_col]).copy()
-        sub["cd"] = sub["cycleDay"].astype(float).clip(1, 28).astype(int)
+    sub = pd.DataFrame()
+    if perf_col and "cycleDay" in r.columns:
+        sub = r.dropna(subset=["cycleDay", perf_col]).copy()
+        sub["cd"] = sub["cycleDay"].astype(float).astype(int)
+        sub = sub[sub["cd"].between(1, 28)]
+    if len(sub):
         by_day = sub.groupby("cd")[perf_col].mean()
         full = pd.Series({i: by_day.get(i, np.nan) for i in range(1, 29)})
         full = full.interpolate(method="linear", limit_direction="both").ffill().bfill()
@@ -530,7 +655,7 @@ def get_insights():
     if "avgHr" in r.columns and "cyclePhase" in r.columns:
         pace_col = next((c for c in ("pace", "pace_min_per_km") if c in r.columns), None)
         if pace_col:
-            z2 = r[(r["avgHr"].between(120, 155))].dropna(subset=["cyclePhase", pace_col])
+            z2 = r[(r["avgHr"].between(120, 155)) & (r[pace_col] > 0)].dropna(subset=["cyclePhase", pace_col])
             if len(z2) >= 4:
                 g = z2.groupby("cyclePhase")[pace_col].mean()
                 vals = {p: float(g[p]) for p in PHASE_ORDER if p in g.index}
@@ -559,8 +684,12 @@ def get_insights():
     else:
         summary = "Keep logging to see your metrics by phase."
 
-    n_cycles = max(1, len(d) // _cycle_length(d)) if len(d) > 0 else 0
-    n_runs   = len(r)
+    # Distinct period start dates seen in the data
+    n_cycles = 0
+    if "cycleDay" in d.columns:
+        known = d.dropna(subset=["cycleDay"])
+        n_cycles = int((known["Date"] - pd.to_timedelta(known["cycleDay"].astype(float) - 1, unit="D")).nunique())
+    n_runs = len(r)
 
     return {
         "performanceRhythm": performance_rhythm,
@@ -583,9 +712,8 @@ def get_insights():
 @app.get("/learn")
 def get_learn():
     d = daily()
-    phase = _resolve_phase(d)
-    cycle_day = _resolve_cycle_day(d)
-    cl = _cycle_length(d)
+    cyc = _cycle_state(d)
+    phase, cycle_day, cl = cyc["phase"], cyc["cycleDay"], cyc["cycleLength"]
     bounds = _phase_day_bounds(cl)
 
     PHASE_PREVIEW = {
@@ -659,7 +787,9 @@ def get_phase_detail(key: str):
         "menstrual": "Menstrual", "follicular": "Follicular",
         "ovulatory": "Ovulatory", "luteal": "Luteal",
     }
-    phase = KEY_MAP.get(key.lower(), "Follicular")
+    phase = KEY_MAP.get(key.lower())
+    if phase is None:
+        raise HTTPException(status_code=404, detail=f"Unknown phase '{key}'")
     cl = _cycle_length(d)
     bounds = _phase_day_bounds(cl)
     ps, pe = bounds[phase]
@@ -720,7 +850,7 @@ def get_phase_detail(key: str):
         data_insight = "Log more days to see your personal pattern for this phase."
 
     return {
-        "key":          key,
+        "key":          key.lower(),
         "emoji":        PHASE_EMOJI[phase],
         "name":         phase,
         "dayRange":     f"Days {ps}–{pe}",
@@ -735,101 +865,162 @@ def get_phase_detail(key: str):
 
 
 # ─── /workout/{id} ────────────────────────────────────────────────────────────
+SEG_COLOR = {"warmup": "#D3D1C7", "cooldown": "#D3D1C7", "recovery": "#5DCAA5"}
+WORK_COLOR = {"easy": "#5DCAA5", "tempo": "#EF9F27", "interval": "#EF9F27", "long": "#7F77DD",
+              "fartlek": "#EF9F27", "hills": "#D85A30", "race": "#D4537E"}
+
+
+def _seg(kind: str, title: str, minutes: float, cue: str | None, wt: str = "easy") -> dict:
+    return {
+        "kind":        kind,
+        "title":       title,
+        "durationMin": max(1, int(round(minutes))),
+        "cue":         cue,
+        "color":       SEG_COLOR.get(kind) or WORK_COLOR.get(wt, "#5DCAA5"),
+    }
+
+
+def _repeat(n: int, work: dict, rec: dict, cues: list[str]) -> list[dict]:
+    """n work blocks separated by recoveries; cues go on the first, second and last block."""
+    out = []
+    for i in range(n):
+        cue = cues[0] if i == 0 else cues[-1] if i == n - 1 else cues[1] if i == 1 else None
+        out.append(dict(work, cue=cue))
+        if i < n - 1:
+            out.append(dict(rec, cue=rec["cue"] if i == 0 else None))
+    return out
+
+
+def _workout_segments(wt: str, km: float, details: str, paces: dict) -> list[dict]:
+    """Session structure sized to the planned distance and the plan's pace zones."""
+    if wt == "rest" or km <= 0:
+        return []
+    easy_min = lambda dist: dist * paces["easy"] / 60  # noqa: E731
+
+    if wt == "easy":
+        return [_seg("work", "Easy run", easy_min(km), "Conversational pace — you should be able to chat")]
+
+    if wt == "race":
+        return [
+            _seg("warmup", "Warm up", 10, "Easy jog plus a few strides"),
+            _seg("work", "Race", km * paces["mp"] / 60, "Start controlled, finish strong", wt),
+        ]
+
+    if wt == "long":
+        total = km * paces["easy_slow"] / 60
+        return [
+            _seg("warmup", "Warm up", 10, "Start slow, let your body wake up"),
+            _seg("work", "Steady run", max(10, total - 15), "Find a sustainable rhythm", wt),
+            _seg("cooldown", "Cool down", 5, "Slow to a jog, then walk"),
+        ]
+
+    if wt == "tempo":
+        m = re.search(r"w/(\d+(?:\.\d+)?)\s*km", details or "")
+        tempo_km = float(m.group(1)) if m else round(km * 0.4)
+        tempo_total = tempo_km * paces["tempo"] / 60
+        blocks = max(1, int(round(tempo_total / 8)))
+        work = _seg("work", "Tempo interval", tempo_total / blocks, None, wt)
+        rec = _seg("recovery", "Recovery jog", 2, "Slow down, let HR drop")
+        cool = max(5, easy_min(km - tempo_km) - 10 - 2 * (blocks - 1))
+        return ([_seg("warmup", "Warm up", 10, "Easy pace, find your rhythm")]
+                + _repeat(blocks, work, rec, ["Comfortably hard", "Same effort as first", "Last one — hold steady"])
+                + [_seg("cooldown", "Cool down", cool, "Easy jog, then walk")])
+
+    if wt == "interval":
+        m = re.search(r"(\d+)\s*×\s*(\d+)\s*m", details or "")
+        reps, rep_m = (int(m.group(1)), int(m.group(2))) if m else (5, 1000)
+        work = _seg("work", "Hard interval", rep_m / 1000 * paces["interval"] / 60, None, wt)
+        rec = _seg("recovery", "Recovery", 2, "Walk or jog slowly")
+        cool = max(5, easy_min(max(0.0, km - reps * rep_m / 1000)) - 10 - 2 * (reps - 1))
+        return ([_seg("warmup", "Warm up", 10, "Easy pace, loosen up")]
+                + _repeat(reps, work, rec, ["Hard effort — 85–90% max HR", "Same effort — don't start fast", "Dig deep"])
+                + [_seg("cooldown", "Cool down", cool, "Easy jog, then walk")])
+
+    if wt in ("fartlek", "hills"):
+        reps = 6
+        if wt == "fartlek":
+            work = _seg("work", "Surge", 2, None, wt)
+            rec = _seg("recovery", "Float", 2, "Easy running, not walking")
+            cues = ["Quick but relaxed", "Play with the pace", "Last surge — enjoy it"]
+        else:
+            work = _seg("work", "Hill repeat", 1, None, wt)
+            rec = _seg("recovery", "Jog down", 2, "Easy jog back to the start")
+            cues = ["Strong arms, short steps", "Drive with your knees", "Last one — tall posture"]
+        block = reps * (work["durationMin"] + rec["durationMin"]) - rec["durationMin"]
+        cool = max(5, easy_min(km) - 10 - block)
+        return ([_seg("warmup", "Warm up", 10, "Easy pace, loosen up")]
+                + _repeat(reps, work, rec, cues)
+                + [_seg("cooldown", "Cool down", cool, "Easy jog, then walk")])
+
+    return [_seg("work", WTYPE_LABEL.get(wt, "Run"), easy_min(km), None, wt)]
+
+
 @app.get("/workout/{workout_id}")
 def get_workout(workout_id: str):
     d = daily()
-    phase = _resolve_phase(d)
 
     PHASE_TIPS = {
-        "Follicular": "Your body is primed for intensity. Push the intervals — this is your window.",
+        "Follicular": "Your body is primed for intensity — a great window to push quality.",
         "Ovulatory":  "Peak energy window. You might feel stronger than usual — trust it.",
         "Luteal":     "HR may feel 3–5 bpm higher today. Go by effort, not numbers.",
         "Menstrual":  "Energy may be lower. It's okay to cut short or swap for easy if needed.",
     }
 
-    parts = workout_id.split("_")
-    day_key = parts[0] if parts else "Mon"
+    # Accepts "Tue_2026-10-27" (as sent in /plan) or a bare day key like "Tue"
+    day_key = workout_id.split("_")[0][:3].capitalize()
+    if day_key not in DAY_KEYS:
+        raise HTTPException(status_code=404, detail=f"Unknown workout '{workout_id}'")
 
-    WTYPE_SEGMENTS = {
-        "tempo": [
-            {"kind": "warmup",   "title": "Warm up",        "durationMin": 10, "cue": "Easy pace, find your rhythm",    "color": "#D3D1C7"},
-            {"kind": "work",     "title": "Tempo interval", "durationMin": 8,  "cue": "Comfortably hard",               "color": "#EF9F27"},
-            {"kind": "recovery", "title": "Recovery jog",   "durationMin": 2,  "cue": "Slow down, let HR drop",         "color": "#5DCAA5"},
-            {"kind": "work",     "title": "Tempo interval", "durationMin": 8,  "cue": "Same effort as first",           "color": "#EF9F27"},
-            {"kind": "recovery", "title": "Recovery jog",   "durationMin": 2,  "cue": None,                             "color": "#5DCAA5"},
-            {"kind": "work",     "title": "Tempo interval", "durationMin": 8,  "cue": "Last one — hold steady",         "color": "#EF9F27"},
-            {"kind": "cooldown", "title": "Cool down",      "durationMin": 8,  "cue": "Easy jog, then walk",            "color": "#D3D1C7"},
-        ],
-        "intervals": [
-            {"kind": "warmup",   "title": "Warm up",       "durationMin": 10, "cue": "Easy pace, loosen up",             "color": "#D3D1C7"},
-            {"kind": "work",     "title": "Hard interval", "durationMin": 4,  "cue": "Hard effort — 85–90% max HR",     "color": "#EF9F27"},
-            {"kind": "recovery", "title": "Recovery",      "durationMin": 2,  "cue": "Walk or jog slowly",               "color": "#5DCAA5"},
-            {"kind": "work",     "title": "Hard interval", "durationMin": 4,  "cue": "Same effort — don't start fast",  "color": "#EF9F27"},
-            {"kind": "recovery", "title": "Recovery",      "durationMin": 2,  "cue": None,                               "color": "#5DCAA5"},
-            {"kind": "work",     "title": "Hard interval", "durationMin": 4,  "cue": "Dig deep",                         "color": "#EF9F27"},
-            {"kind": "cooldown", "title": "Cool down",     "durationMin": 8,  "cue": "Easy jog, then walk",              "color": "#D3D1C7"},
-        ],
-        "long run": [
-            {"kind": "warmup",   "title": "Warm up",    "durationMin": 10, "cue": "Start slow, let your body wake up",   "color": "#D3D1C7"},
-            {"kind": "work",     "title": "Steady run", "durationMin": 60, "cue": "Find a sustainable rhythm",           "color": "#7F77DD"},
-            {"kind": "cooldown", "title": "Cool down",  "durationMin": 5,  "cue": "Slow to a jog, then walk",            "color": "#D3D1C7"},
-        ],
-        "easy": [
-            {"kind": "work", "title": "Easy run", "durationMin": 35, "cue": "Conversational pace — you should be able to chat", "color": "#5DCAA5"},
-        ],
-    }
-
-    try:
-        plan_data = get_plan()
-        week = plan_data.get("week", [])
-        wo = next((w for w in week if w["dayName"] == day_key), None)
-        if wo:
-            wt = wo["type"]
-            dist = wo["distanceKm"]
-            segs = WTYPE_SEGMENTS.get(wt, WTYPE_SEGMENTS["easy"])
-            label_map = {"easy": "Easy run", "tempo": "Tempo run", "intervals": "Intervals", "long run": "Long run", "rest": "Rest"}
-            return {
-                "id":             workout_id,
-                "dateLabel":      day_key,
-                "type":           wt,
-                "distanceKm":     dist,
-                "structureLabel": label_map.get(wt, wt.capitalize()),
-                "timeEstimate":   f"{int(dist*5.5)}–{int(dist*6.5)} min",
-                "segments":       segs,
-                "phaseTip":       PHASE_TIPS.get(phase, "Listen to your body and adapt as needed."),
-                "override":       None,
-            }
-    except Exception:
-        pass
+    plan = _build_plan(d)
+    paces = _paces_raw(plan["fp"])
+    wo = next(w for w in plan["week"] if w["dayName"] == day_key)
+    wt, dist = wo["type"], wo["distanceKm"]
+    segs = _workout_segments(wt, dist, wo["details"], paces)
+    total = sum(s["durationMin"] for s in segs)
 
     return {
         "id":             workout_id,
         "dateLabel":      day_key,
-        "type":           "easy",
-        "distanceKm":     5.0,
-        "structureLabel": "Easy run",
-        "timeEstimate":   "28–33 min",
-        "segments":       WTYPE_SEGMENTS["easy"],
-        "phaseTip":       PHASE_TIPS.get(phase, "Listen to your body."),
+        "date":           wo["date"],
+        "type":           wt,
+        "distanceKm":     dist,
+        "details":        wo["details"],
+        "structureLabel": WTYPE_LABEL.get(wt, wt.capitalize()),
+        "timeEstimate":   f"{int(total * 0.92)}–{int(math.ceil(total * 1.08))} min" if total else "—",
+        "segments":       segs,
+        "phase":          wo["phase"],
+        "phaseTip":       PHASE_TIPS.get(wo["phase"], "Listen to your body and adapt as needed."),
         "override":       None,
     }
 
 
-# ─── /debrief (POST) ──────────────────────────────────────────────────────────
+# ─── /debrief ─────────────────────────────────────────────────────────────────
+def _read_debriefs() -> list:
+    if not os.path.exists(DEBRIEF_PATH):
+        return []
+    try:
+        with open(DEBRIEF_PATH) as f:
+            existing = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return existing if isinstance(existing, list) else []
+
+
 @app.post("/debrief")
 def save_debrief(debrief: dict):
     """Save workout debrief to JSON file."""
-    path = os.path.join(BASE_DIR, "workout_debriefs.json")
-    existing = []
-    if os.path.exists(path):
-        with open(path) as f:
-            existing = json.load(f)
-    if not isinstance(existing, list):
-        existing = []
-    existing.append(debrief)
-    with open(path, "w") as f:
+    existing = _read_debriefs()
+    existing.append(dict(debrief, savedAt=pd.Timestamp.now().isoformat(timespec="seconds")))
+    tmp = DEBRIEF_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(existing, f, indent=2, default=str)
-    return {"status": "saved"}
+    os.replace(tmp, DEBRIEF_PATH)
+    return {"status": "saved", "count": len(existing)}
+
+
+@app.get("/debriefs")
+def list_debriefs():
+    return {"debriefs": _read_debriefs()}
 
 
 # ─── /health ──────────────────────────────────────────────────────────────────

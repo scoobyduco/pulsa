@@ -12,3 +12,5 @@ figures/
 *.html
 *.pdf
 *.md
+.pytest_cache/
+workout_debriefs.json

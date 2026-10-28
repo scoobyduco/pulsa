@@ -392,11 +392,11 @@ def _quality_session(
     week_idx: int,
     primary: bool = True,
 ) -> dict:
+    # Use raw paces: zone2–4 labels mean different things per goal (and "Varied" for maintenance)
     raw = paces.get("_raw", {})
     easy_p  = _fmt_pace(raw.get("easy_fast", 378))
-    tempo_p = paces.get("zone3", "5:00")
-    iv_p    = paces.get("zone4", "4:30")
-    mp_p    = paces.get("zone2", "5:00")
+    tempo_p = _fmt_pace(raw.get("tempo", 320))
+    iv_p    = _fmt_pace(raw.get("interval", 295))
 
     if phase == "Taper":
         return _tempo(round(km), round(km * 0.4), easy_p, tempo_p)

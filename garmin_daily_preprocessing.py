@@ -26,6 +26,7 @@ import pandas as pd
 import numpy as np
 
 DATA_FOLDER = os.environ.get("GARMIN_DATA_PATH", "./garmin_data")
+MAX_CYCLE_DAY = 45
 
 
 def _discover_files(folder_path: str) -> dict:
@@ -387,6 +388,9 @@ def _load_cycle(folder_path: str) -> pd.DataFrame:
     merged["cycleEndDate"] = merged["startDate"] + pd.to_timedelta(merged["actualCycleLength"], unit="D")
     merged["cycleDay"] = (merged["Date"] - merged["startDate"]).dt.days + 1
     merged.loc[merged["cycleDay"] <= 0, "cycleDay"] = np.nan
+    # Without a newer logged period Garmin's last cycle never ends; past this the
+    # phase is unknown rather than an endless "Luteal".
+    merged.loc[merged["cycleDay"] > MAX_CYCLE_DAY, "cycleDay"] = np.nan
 
     merged["isPeriod"] = merged["cycleDay"] <= merged["actualPeriodLength"]
     merged["fertileStartDay"] = merged["fertileWindowStart"]
@@ -400,6 +404,7 @@ def _load_cycle(folder_path: str) -> pd.DataFrame:
         merged["cycleDay"] > merged["fertileEndDay"],
     ]
     merged["cyclePhase"] = np.select(conditions, ["Menstrual", "Follicular", "Ovulatory", "Luteal"], default="Unknown")
+    merged.loc[merged["cycleDay"].isna(), "cyclePhase"] = np.nan
 
     merged["cycleProgress"] = np.where(
         merged["actualCycleLength"] > 0,

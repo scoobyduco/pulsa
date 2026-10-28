@@ -30,7 +30,10 @@ recovery, and performance interact** in endurance running.
 def load_data():
     df = pd.read_excel("running_engine_output.xlsx")
     df["Date"] = pd.to_datetime(df["Date"])
-    return df
+    # Unlogged periods leave cycleDay counting up forever; those phases are unknown
+    stale = df["cycleDay"] > 45
+    df.loc[stale, ["cycleDay", "cyclePhase", "cycleProgress"]] = np.nan
+    return df.sort_values("Date")
 
 
 df = load_data()
@@ -53,14 +56,27 @@ if time_filter == "Last 30 Days":
     df_filtered = df[df["Date"] >= cutoff]
 
 elif time_filter == "Last Cycle":
-    cycle_starts = df[df["cyclePhase"] == "Menstrual"]
+    # Most recent complete cycle: from the second-to-last period start up to the last one
+    cycle_starts = df.loc[df["cycleDay"] == 1, "Date"]
     if len(cycle_starts) >= 2:
-        last_start = cycle_starts.iloc[-1]["Date"]
-        prev_start = cycle_starts.iloc[-2]["Date"]
+        prev_start, last_start = cycle_starts.iloc[-2], cycle_starts.iloc[-1]
         df_filtered = df[
             (df["Date"] >= prev_start) &
-            (df["Date"] <= last_start)
+            (df["Date"] < last_start)
         ]
+
+if df_filtered.empty:
+    st.warning("No data in this time window.")
+    st.stop()
+
+
+def fmt_int(v):
+    return "—" if pd.isna(v) else int(v)
+
+
+def latest_value(col):
+    s = df_filtered[col].dropna()
+    return s.iloc[-1] if len(s) else np.nan
 
 # ---------------------------------------------------
 # SECTION 1 — CURRENT STATUS
@@ -68,13 +84,14 @@ elif time_filter == "Last Cycle":
 
 st.header("1️⃣ Current Physiological Status")
 
-latest = df_filtered.sort_values("Date").iloc[-1]
+latest = df_filtered.iloc[-1]
+st.caption(f"Data as of {latest['Date'].date()}")
 
 col1, col2, col3, col4 = st.columns(4)
 
-col1.metric("Readiness Score", int(latest["readiness_score"]))
-col2.metric("Cycle Phase", latest["cyclePhase"])
-col3.metric("3-Day Load", int(latest["load_3d"]))
+col1.metric("Readiness Score", fmt_int(latest_value("readiness_score")))
+col2.metric("Cycle Phase", latest_value("cyclePhase") if pd.notna(latest_value("cyclePhase")) else "—")
+col3.metric("3-Day Load", fmt_int(latest_value("load_3d")))
 col4.metric("Session Flag", latest["session_flag"])
 
 # ---------------------------------------------------
@@ -155,17 +172,17 @@ col1, col2 = st.columns(2)
 
 with col1:
     fig, ax = plt.subplots()
-    df.boxplot(column="efficiency_index", by="cyclePhase", ax=ax)
+    df.boxplot(column="efficiency", by="cyclePhase", ax=ax)
     plt.suptitle("")
     ax.set_title("Efficiency by Cycle Phase")
     st.pyplot(fig)
 
 with col2:
     fig, ax = plt.subplots()
-    d = df.dropna(subset=["cycleProgress", "efficiency_index"])
-    ax.scatter(d["cycleProgress"], d["efficiency_index"], alpha=0.3)
+    d = df.dropna(subset=["cycleProgress", "efficiency"])
+    ax.scatter(d["cycleProgress"], d["efficiency"], alpha=0.3)
     if len(d) > 1:
-        z = np.polyfit(d["cycleProgress"], d["efficiency_index"], 1)
+        z = np.polyfit(d["cycleProgress"], d["efficiency"], 1)
         p = np.poly1d(z)
         x_line = np.linspace(d["cycleProgress"].min(), d["cycleProgress"].max(), 100)
         ax.plot(x_line, p(x_line), "r-", linewidth=2)
@@ -187,10 +204,14 @@ st.bar_chart(session_counts)
 
 st.header("7️⃣ Cycle-Aware Interpretation")
 
-cycle = latest["cyclePhase"]
-rhr_z = latest.get("rhr_z", 0)
-load = latest.get("load_3d", 0)
-sleep_debt = latest.get("sleep_debt_3day", 0) or 0
+cycle = latest_value("cyclePhase")
+cycle = cycle if pd.notna(cycle) else "Unknown"
+rhr_z = latest_value("rhr_z")
+rhr_z = 0 if pd.isna(rhr_z) else rhr_z
+load = latest_value("load_3d")
+load = 0 if pd.isna(load) else load
+sleep_debt = latest_value("sleep_debt_3day")
+sleep_debt = 0 if pd.isna(sleep_debt) else sleep_debt
 
 # Physiological signal
 if rhr_z > 1.5:
